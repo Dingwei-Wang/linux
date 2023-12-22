@@ -16,7 +16,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/property.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/power/sbs-battery.h>
 #include <linux/power_supply.h>
 #include <linux/slab.h>
@@ -31,8 +31,9 @@ enum {
 	REG_CURRENT_AVG,
 	REG_MAX_ERR,
 	REG_CAPACITY,
-	REG_TIME_TO_EMPTY,
-	REG_TIME_TO_FULL,
+	REG_TIME_TO_EMPTY_NOW,
+	REG_TIME_TO_EMPTY_AVG,
+	REG_TIME_TO_FULL_AVG,
 	REG_STATUS,
 	REG_CAPACITY_LEVEL,
 	REG_CYCLE_COUNT,
@@ -102,7 +103,7 @@ static const struct chip_data {
 	[REG_TEMPERATURE] =
 		SBS_DATA(POWER_SUPPLY_PROP_TEMP, 0x08, 0, 65535),
 	[REG_VOLTAGE] =
-		SBS_DATA(POWER_SUPPLY_PROP_VOLTAGE_NOW, 0x09, 0, 20000),
+		SBS_DATA(POWER_SUPPLY_PROP_VOLTAGE_NOW, 0x09, 0, 65535),
 	[REG_CURRENT_NOW] =
 		SBS_DATA(POWER_SUPPLY_PROP_CURRENT_NOW, 0x0A, -32768, 32767),
 	[REG_CURRENT_AVG] =
@@ -119,9 +120,11 @@ static const struct chip_data {
 		SBS_DATA(POWER_SUPPLY_PROP_ENERGY_FULL, 0x10, 0, 65535),
 	[REG_FULL_CHARGE_CAPACITY_CHARGE] =
 		SBS_DATA(POWER_SUPPLY_PROP_CHARGE_FULL, 0x10, 0, 65535),
-	[REG_TIME_TO_EMPTY] =
+	[REG_TIME_TO_EMPTY_NOW] =
+		SBS_DATA(POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW, 0x11, 0, 65535),
+	[REG_TIME_TO_EMPTY_AVG] =
 		SBS_DATA(POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG, 0x12, 0, 65535),
-	[REG_TIME_TO_FULL] =
+	[REG_TIME_TO_FULL_AVG] =
 		SBS_DATA(POWER_SUPPLY_PROP_TIME_TO_FULL_AVG, 0x13, 0, 65535),
 	[REG_CHARGE_CURRENT] =
 		SBS_DATA(POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX, 0x14, 0, 65535),
@@ -165,6 +168,7 @@ static const enum power_supply_property sbs_properties[] = {
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_CAPACITY_ERROR_MARGIN,
 	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW,
 	POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
 	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
 	POWER_SUPPLY_PROP_SERIAL_NUMBER,
@@ -748,6 +752,7 @@ static void  sbs_unit_adjustment(struct i2c_client *client,
 		val->intval -= TEMP_KELVIN_TO_CELSIUS;
 		break;
 
+	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW:
 	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG:
 	case POWER_SUPPLY_PROP_TIME_TO_FULL_AVG:
 		/* sbs provides time to empty and time to full in minutes.
@@ -966,6 +971,7 @@ static int sbs_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 	case POWER_SUPPLY_PROP_CURRENT_AVG:
 	case POWER_SUPPLY_PROP_TEMP:
+	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW:
 	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG:
 	case POWER_SUPPLY_PROP_TIME_TO_FULL_AVG:
 	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
@@ -1129,7 +1135,7 @@ static int sbs_probe(struct i2c_client *client)
 	if (!chip)
 		return -ENOMEM;
 
-	chip->flags = (u32)(uintptr_t)device_get_match_data(&client->dev);
+	chip->flags = (uintptr_t)i2c_get_match_data(client);
 	chip->client = client;
 	psy_cfg.of_node = client->dev.of_node;
 	psy_cfg.drv_data = chip;
@@ -1247,9 +1253,9 @@ static SIMPLE_DEV_PM_OPS(sbs_pm_ops, sbs_suspend, NULL);
 #endif
 
 static const struct i2c_device_id sbs_id[] = {
-	{ "bq20z65", 0 },
-	{ "bq20z75", 0 },
-	{ "sbs-battery", 1 },
+	{ "bq20z65", SBS_FLAGS_TI_BQ20ZX5 },
+	{ "bq20z75", SBS_FLAGS_TI_BQ20ZX5 },
+	{ "sbs-battery", 0 },
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, sbs_id);
@@ -1269,7 +1275,7 @@ static const struct of_device_id sbs_dt_ids[] = {
 MODULE_DEVICE_TABLE(of, sbs_dt_ids);
 
 static struct i2c_driver sbs_battery_driver = {
-	.probe_new	= sbs_probe,
+	.probe		= sbs_probe,
 	.alert		= sbs_alert,
 	.id_table	= sbs_id,
 	.driver = {

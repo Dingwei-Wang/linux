@@ -280,6 +280,7 @@ static int accel_3d_capture_sample(struct hid_sensor_hub_device *hsdev,
 			hid_sensor_convert_timestamp(
 					&accel_state->common_attributes,
 					*(int64_t *)raw_data);
+		ret = 0;
 	break;
 	default:
 		break;
@@ -367,7 +368,8 @@ static int hid_accel_3d_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "failed to setup common attributes\n");
 		return ret;
 	}
-	indio_dev->channels = kmemdup(channel_spec, channel_size, GFP_KERNEL);
+	indio_dev->channels = devm_kmemdup(&pdev->dev, channel_spec,
+					   channel_size, GFP_KERNEL);
 
 	if (!indio_dev->channels) {
 		dev_err(&pdev->dev, "failed to duplicate channels\n");
@@ -378,7 +380,7 @@ static int hid_accel_3d_probe(struct platform_device *pdev)
 				hsdev->usage, accel_state);
 	if (ret) {
 		dev_err(&pdev->dev, "failed to setup attributes\n");
-		goto error_free_dev_mem;
+		return ret;
 	}
 
 	indio_dev->info = &accel_3d_info;
@@ -391,7 +393,7 @@ static int hid_accel_3d_probe(struct platform_device *pdev)
 					&accel_state->common_attributes);
 	if (ret < 0) {
 		dev_err(&pdev->dev, "trigger setup failed\n");
-		goto error_free_dev_mem;
+		return ret;
 	}
 
 	ret = iio_device_register(indio_dev);
@@ -416,13 +418,11 @@ error_iio_unreg:
 	iio_device_unregister(indio_dev);
 error_remove_trigger:
 	hid_sensor_remove_trigger(indio_dev, &accel_state->common_attributes);
-error_free_dev_mem:
-	kfree(indio_dev->channels);
 	return ret;
 }
 
 /* Function to deinitialize the processing for usage id */
-static int hid_accel_3d_remove(struct platform_device *pdev)
+static void hid_accel_3d_remove(struct platform_device *pdev)
 {
 	struct hid_sensor_hub_device *hsdev = pdev->dev.platform_data;
 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
@@ -431,9 +431,6 @@ static int hid_accel_3d_remove(struct platform_device *pdev)
 	sensor_hub_remove_callback(hsdev, hsdev->usage);
 	iio_device_unregister(indio_dev);
 	hid_sensor_remove_trigger(indio_dev, &accel_state->common_attributes);
-	kfree(indio_dev->channels);
-
-	return 0;
 }
 
 static const struct platform_device_id hid_accel_3d_ids[] = {
@@ -455,7 +452,7 @@ static struct platform_driver hid_accel_3d_platform_driver = {
 		.pm	= &hid_sensor_pm_ops,
 	},
 	.probe		= hid_accel_3d_probe,
-	.remove		= hid_accel_3d_remove,
+	.remove_new	= hid_accel_3d_remove,
 };
 module_platform_driver(hid_accel_3d_platform_driver);
 

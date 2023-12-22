@@ -29,6 +29,7 @@
 #include "color.h"
 #include "map.h"
 #include "maps.h"
+#include "mutex.h"
 #include "symbol.h"
 #include <api/fs/fs.h>
 #include "trace-event.h"	/* For __maybe_unused */
@@ -52,6 +53,8 @@
 bool probe_event_dry_run;	/* Dry run flag */
 struct probe_conf probe_conf = { .magic_num = DEFAULT_PROBE_MAGIC_NUM };
 
+static char *synthesize_perf_probe_point(struct perf_probe_point *pp);
+
 #define semantic_error(msg ...) pr_err("Semantic error :" msg)
 
 int e_snprintf(char *str, size_t size, const char *format, ...)
@@ -73,7 +76,6 @@ int init_probe_symbol_maps(bool user_only)
 {
 	int ret;
 
-	symbol_conf.sort_by_name = true;
 	symbol_conf.allow_aliases = true;
 	ret = symbol__init(NULL);
 	if (ret < 0) {
@@ -134,15 +136,15 @@ static int kernel_get_symbol_address_by_name(const char *name, u64 *addr,
 	/* ref_reloc_sym is just a label. Need a special fix*/
 	reloc_sym = kernel_get_ref_reloc_sym(&map);
 	if (reloc_sym && strcmp(name, reloc_sym->name) == 0)
-		*addr = (!map->reloc || reloc) ? reloc_sym->addr :
+		*addr = (!map__reloc(map) || reloc) ? reloc_sym->addr :
 			reloc_sym->unrelocated_addr;
 	else {
 		sym = machine__find_kernel_symbol_by_name(host_machine, name, &map);
 		if (!sym)
 			return -ENOENT;
-		*addr = map->unmap_ip(map, sym->start) -
-			((reloc) ? 0 : map->reloc) -
-			((reladdr) ? map->start : 0);
+		*addr = map__unmap_ip(map, sym->start) -
+			((reloc) ? 0 : map__reloc(map)) -
+			((reladdr) ? map__start(map) : 0);
 	}
 	return 0;
 }
@@ -150,23 +152,28 @@ static int kernel_get_symbol_address_by_name(const char *name, u64 *addr,
 static struct map *kernel_get_module_map(const char *module)
 {
 	struct maps *maps = machine__kernel_maps(host_machine);
-	struct map *pos;
+	struct map_rb_node *pos;
 
 	/* A file path -- this is an offline module */
 	if (module && strchr(module, '/'))
 		return dso__new_map(module);
 
 	if (!module) {
-		pos = machine__kernel_map(host_machine);
-		return map__get(pos);
+		struct map *map = machine__kernel_map(host_machine);
+
+		return map__get(map);
 	}
 
 	maps__for_each_entry(maps, pos) {
 		/* short_name is "[module]" */
-		if (strncmp(pos->dso->short_name + 1, module,
-			    pos->dso->short_name_len - 2) == 0 &&
-		    module[pos->dso->short_name_len - 2] == '\0') {
-			return map__get(pos);
+		struct dso *dso = map__dso(pos->map);
+		const char *short_name = dso->short_name;
+		u16 short_name_len =  dso->short_name_len;
+
+		if (strncmp(short_name + 1, module,
+			    short_name_len - 2) == 0 &&
+		    module[short_name_len - 2] == '\0') {
+			return map__get(pos->map);
 		}
 	}
 	return NULL;
@@ -177,10 +184,16 @@ struct map *get_target_map(const char *target, struct nsinfo *nsi, bool user)
 	/* Init maps of given executable or kernel */
 	if (user) {
 		struct map *map;
+		struct dso *dso;
 
 		map = dso__new_map(target);
-		if (map && map->dso)
-			map->dso->nsinfo = nsinfo__get(nsi);
+		dso = map ? map__dso(map) : NULL;
+		if (dso) {
+			mutex_lock(&dso->lock);
+			nsinfo__put(dso->nsinfo);
+			dso->nsinfo = nsinfo__get(nsi);
+			mutex_unlock(&dso->lock);
+		}
 		return map;
 	} else {
 		return kernel_get_module_map(target);
@@ -237,15 +250,15 @@ static void clear_probe_trace_events(struct probe_trace_event *tevs, int ntevs)
 		clear_probe_trace_event(tevs + i);
 }
 
-static bool kprobe_blacklist__listed(unsigned long address);
-static bool kprobe_warn_out_range(const char *symbol, unsigned long address)
+static bool kprobe_blacklist__listed(u64 address);
+static bool kprobe_warn_out_range(const char *symbol, u64 address)
 {
 	struct map *map;
 	bool ret = false;
 
 	map = kernel_get_module_map(NULL);
 	if (map) {
-		ret = address <= map->start || map->end < address;
+		ret = address <= map__start(map) || map__end(map) < address;
 		if (ret)
 			pr_warning("%s is out of .text, skip it.\n", symbol);
 		map__put(map);
@@ -330,9 +343,9 @@ static int kernel_get_module_dso(const char *module, struct dso **pdso)
 		char module_name[128];
 
 		snprintf(module_name, sizeof(module_name), "[%s]", module);
-		map = maps__find_by_name(&host_machine->kmaps, module_name);
+		map = maps__find_by_name(machine__kernel_maps(host_machine), module_name);
 		if (map) {
-			dso = map->dso;
+			dso = map__dso(map);
 			goto found;
 		}
 		pr_debug("Failed to find module %s.\n", module);
@@ -340,7 +353,7 @@ static int kernel_get_module_dso(const char *module, struct dso **pdso)
 	}
 
 	map = machine__kernel_map(host_machine);
-	dso = map->dso;
+	dso = map__dso(map);
 	if (!dso->has_build_id)
 		dso__read_running_kernel_build_id(dso, host_machine);
 
@@ -370,6 +383,7 @@ static int find_alternative_probe_point(struct debuginfo *dinfo,
 	struct symbol *sym;
 	u64 address = 0;
 	int ret = -ENOENT;
+	size_t idx;
 
 	/* This can work only for function-name based one */
 	if (!pp->function || pp->file)
@@ -380,7 +394,7 @@ static int find_alternative_probe_point(struct debuginfo *dinfo,
 		return -EINVAL;
 
 	/* Find the address of given function */
-	map__for_each_symbol_by_name(map, pp->function, sym) {
+	map__for_each_symbol_by_name(map, pp->function, sym, idx) {
 		if (uprobes) {
 			address = sym->start;
 			if (sym->type == STT_GNU_IFUNC)
@@ -388,7 +402,7 @@ static int find_alternative_probe_point(struct debuginfo *dinfo,
 					   "Consider identifying the final function used at run time and set the probe directly on that.\n",
 					   pp->function);
 		} else
-			address = map->unmap_ip(map, sym->start) - map->reloc;
+			address = map__unmap_ip(map, sym->start) - map__reloc(map);
 		break;
 	}
 	if (!address) {
@@ -398,8 +412,7 @@ static int find_alternative_probe_point(struct debuginfo *dinfo,
 	pr_debug("Symbol %s address found : %" PRIx64 "\n",
 			pp->function, address);
 
-	ret = debuginfo__find_probe_point(dinfo, (unsigned long)address,
-					  result);
+	ret = debuginfo__find_probe_point(dinfo, address, result);
 	if (ret <= 0)
 		ret = (!ret) ? -ENOENT : ret;
 	else {
@@ -587,7 +600,7 @@ static void debuginfo_cache__exit(void)
 }
 
 
-static int get_text_start_address(const char *exec, unsigned long *address,
+static int get_text_start_address(const char *exec, u64 *address,
 				  struct nsinfo *nsi)
 {
 	Elf *elf;
@@ -632,7 +645,7 @@ static int find_perf_probe_point_from_dwarf(struct probe_trace_point *tp,
 					    bool is_kprobe)
 {
 	struct debuginfo *dinfo = NULL;
-	unsigned long stext = 0;
+	u64 stext = 0;
 	u64 addr = tp->address;
 	int ret = -ENOENT;
 
@@ -660,8 +673,7 @@ static int find_perf_probe_point_from_dwarf(struct probe_trace_point *tp,
 
 	dinfo = debuginfo_cache__open(tp->module, verbose <= 0);
 	if (dinfo)
-		ret = debuginfo__find_probe_point(dinfo,
-						 (unsigned long)addr, pp);
+		ret = debuginfo__find_probe_point(dinfo, addr, pp);
 	else
 		ret = -ENOENT;
 
@@ -676,7 +688,7 @@ error:
 
 /* Adjust symbol name and address */
 static int post_process_probe_trace_point(struct probe_trace_point *tp,
-					   struct map *map, unsigned long offs)
+					   struct map *map, u64 offs)
 {
 	struct symbol *sym;
 	u64 addr = tp->address - offs;
@@ -719,7 +731,7 @@ post_process_offline_probe_trace_events(struct probe_trace_event *tevs,
 					int ntevs, const char *pathname)
 {
 	struct map *map;
-	unsigned long stext = 0;
+	u64 stext = 0;
 	int i, ret = 0;
 
 	/* Prepare a map for offline binary */
@@ -745,7 +757,7 @@ static int add_exec_to_probe_trace_events(struct probe_trace_event *tevs,
 					  struct nsinfo *nsi)
 {
 	int i, ret = 0;
-	unsigned long stext = 0;
+	u64 stext = 0;
 
 	if (!exec)
 		return 0;
@@ -790,7 +802,7 @@ post_process_module_probe_trace_events(struct probe_trace_event *tevs,
 	mod_name = find_module_name(module);
 	for (i = 0; i < ntevs; i++) {
 		ret = post_process_probe_trace_point(&tevs[i].point,
-						map, (unsigned long)text_offs);
+						map, text_offs);
 		if (ret < 0)
 			break;
 		tevs[i].point.module =
@@ -856,7 +868,7 @@ post_process_kernel_probe_trace_events(struct probe_trace_event *tevs,
 			free(tevs[i].point.symbol);
 		tevs[i].point.symbol = tmp;
 		tevs[i].point.offset = tevs[i].point.address -
-			(map->reloc ? reloc_sym->unrelocated_addr :
+			(map__reloc(map) ? reloc_sym->unrelocated_addr :
 				      reloc_sym->addr);
 	}
 	return skipped;
@@ -914,7 +926,7 @@ static int try_to_find_probe_trace_events(struct perf_probe_event *pev,
 	dinfo = open_debuginfo(pev->target, pev->nsi, !need_dwarf);
 	if (!dinfo) {
 		if (need_dwarf)
-			return -ENOENT;
+			return -ENODATA;
 		pr_debug("Could not open debuginfo. Try to use symbols.\n");
 		return 0;
 	}
@@ -951,9 +963,10 @@ static int try_to_find_probe_trace_events(struct perf_probe_event *pev,
 	debuginfo__delete(dinfo);
 
 	if (ntevs == 0)	{	/* No error but failed to find probe point. */
-		pr_warning("Probe point '%s' not found.\n",
-			   synthesize_perf_probe_point(&pev->point));
-		return -ENOENT;
+		char *probe_point = synthesize_perf_probe_point(&pev->point);
+		pr_warning("Probe point '%s' not found.\n", probe_point);
+		free(probe_point);
+		return -ENODEV;
 	} else if (ntevs < 0) {
 		/* Error path : ntevs < 0 */
 		pr_debug("An error occurred in debuginfo analysis (%d).\n", ntevs);
@@ -1349,7 +1362,7 @@ int parse_line_range_desc(const char *arg, struct line_range *lr)
 				/*
 				 * Adjust the number of lines here.
 				 * If the number of lines == 1, the
-				 * the end of line should be equal to
+				 * end of line should be equal to
 				 * the start of line.
 				 */
 				lr->end--;
@@ -1534,7 +1547,7 @@ static int parse_perf_probe_point(char *arg, struct perf_probe_event *pev)
 		 * so tmp[1] should always valid (but could be '\0').
 		 */
 		if (tmp && !strncmp(tmp, "0x", 2)) {
-			pp->abs_address = strtoul(pp->function, &tmp, 0);
+			pp->abs_address = strtoull(pp->function, &tmp, 0);
 			if (*tmp != '\0') {
 				semantic_error("Invalid absolute address.\n");
 				return -EINVAL;
@@ -1775,8 +1788,10 @@ int parse_perf_probe_command(const char *cmd, struct perf_probe_event *pev)
 	if (!pev->event && pev->point.function && pev->point.line
 			&& !pev->point.lazy_line && !pev->point.offset) {
 		if (asprintf(&pev->event, "%s_L%d", pev->point.function,
-			pev->point.line) < 0)
-			return -ENOMEM;
+			pev->point.line) < 0) {
+			ret = -ENOMEM;
+			goto out;
+		}
 	}
 
 	/* Copy arguments and ensure return probe has no C argument */
@@ -1909,7 +1924,7 @@ int parse_probe_trace_command(const char *cmd, struct probe_trace_event *tev)
 			argv[i] = NULL;
 			argc -= 1;
 		} else
-			tp->address = strtoul(fmt1_str, NULL, 0);
+			tp->address = strtoull(fmt1_str, NULL, 0);
 	} else {
 		/* Only the symbol-based probe has offset */
 		tp->symbol = strdup(fmt1_str);
@@ -1997,7 +2012,7 @@ out:
 }
 
 /* Compose only probe point (not argument) */
-char *synthesize_perf_probe_point(struct perf_probe_point *pp)
+static char *synthesize_perf_probe_point(struct perf_probe_point *pp)
 {
 	struct strbuf buf;
 	char *tmp, *ret = NULL;
@@ -2050,14 +2065,18 @@ char *synthesize_perf_probe_command(struct perf_probe_event *pev)
 			goto out;
 
 	tmp = synthesize_perf_probe_point(&pev->point);
-	if (!tmp || strbuf_addstr(&buf, tmp) < 0)
+	if (!tmp || strbuf_addstr(&buf, tmp) < 0) {
+		free(tmp);
 		goto out;
+	}
 	free(tmp);
 
 	for (i = 0; i < pev->nargs; i++) {
 		tmp = synthesize_perf_probe_arg(pev->args + i);
-		if (!tmp || strbuf_addf(&buf, " %s", tmp) < 0)
+		if (!tmp || strbuf_addf(&buf, " %s", tmp) < 0) {
+			free(tmp);
 			goto out;
+		}
 		free(tmp);
 	}
 
@@ -2155,7 +2174,7 @@ synthesize_uprobe_trace_def(struct probe_trace_point *tp, struct strbuf *buf)
 		return -EINVAL;
 
 	/* Use the tp->address for uprobes */
-	err = strbuf_addf(buf, "%s:0x%lx", tp->module, tp->address);
+	err = strbuf_addf(buf, "%s:0x%" PRIx64, tp->module, tp->address);
 
 	if (err >= 0 && tp->ref_ctr_offset) {
 		if (!uprobe_ref_ctr_is_supported())
@@ -2170,7 +2189,7 @@ synthesize_kprobe_trace_def(struct probe_trace_point *tp, struct strbuf *buf)
 {
 	if (!strncmp(tp->symbol, "0x", 2)) {
 		/* Absolute address. See try_to_find_absolute_address() */
-		return strbuf_addf(buf, "%s%s0x%lx", tp->module ?: "",
+		return strbuf_addf(buf, "%s%s0x%" PRIx64, tp->module ?: "",
 				  tp->module ? ":" : "", tp->address);
 	} else {
 		return strbuf_addf(buf, "%s%s%s+%lu", tp->module ?: "",
@@ -2237,7 +2256,7 @@ static int find_perf_probe_point_from_map(struct probe_trace_point *tp,
 		goto out;
 
 	pp->retprobe = tp->retprobe;
-	pp->offset = addr - map->unmap_ip(map, sym->start);
+	pp->offset = addr - map__unmap_ip(map, sym->start);
 	pp->function = strdup(sym->name);
 	ret = pp->function ? 0 : -ENOMEM;
 
@@ -2269,7 +2288,7 @@ static int convert_to_perf_probe_point(struct probe_trace_point *tp,
 		pp->function = strdup(tp->symbol);
 		pp->offset = tp->offset;
 	} else {
-		ret = e_snprintf(buf, 128, "0x%" PRIx64, (u64)tp->address);
+		ret = e_snprintf(buf, 128, "0x%" PRIx64, tp->address);
 		if (ret < 0)
 			return ret;
 		pp->function = strdup(buf);
@@ -2450,8 +2469,8 @@ void clear_probe_trace_event(struct probe_trace_event *tev)
 
 struct kprobe_blacklist_node {
 	struct list_head list;
-	unsigned long start;
-	unsigned long end;
+	u64 start;
+	u64 end;
 	char *symbol;
 };
 
@@ -2496,7 +2515,7 @@ static int kprobe_blacklist__load(struct list_head *blacklist)
 		}
 		INIT_LIST_HEAD(&node->list);
 		list_add_tail(&node->list, blacklist);
-		if (sscanf(buf, "0x%lx-0x%lx", &node->start, &node->end) != 2) {
+		if (sscanf(buf, "0x%" PRIx64 "-0x%" PRIx64, &node->start, &node->end) != 2) {
 			ret = -EINVAL;
 			break;
 		}
@@ -2512,7 +2531,7 @@ static int kprobe_blacklist__load(struct list_head *blacklist)
 			ret = -ENOMEM;
 			break;
 		}
-		pr_debug2("Blacklist: 0x%lx-0x%lx, %s\n",
+		pr_debug2("Blacklist: 0x%" PRIx64 "-0x%" PRIx64 ", %s\n",
 			  node->start, node->end, node->symbol);
 		ret++;
 	}
@@ -2524,8 +2543,7 @@ static int kprobe_blacklist__load(struct list_head *blacklist)
 }
 
 static struct kprobe_blacklist_node *
-kprobe_blacklist__find_by_address(struct list_head *blacklist,
-				  unsigned long address)
+kprobe_blacklist__find_by_address(struct list_head *blacklist, u64 address)
 {
 	struct kprobe_blacklist_node *node;
 
@@ -2553,7 +2571,7 @@ static void kprobe_blacklist__release(void)
 	kprobe_blacklist__delete(&kprobe_blacklist);
 }
 
-static bool kprobe_blacklist__listed(unsigned long address)
+static bool kprobe_blacklist__listed(u64 address)
 {
 	return !!kprobe_blacklist__find_by_address(&kprobe_blacklist, address);
 }
@@ -2789,13 +2807,18 @@ static void warn_uprobe_event_compat(struct probe_trace_event *tev)
 	if (!tev->uprobes || tev->nargs == 0 || !buf)
 		goto out;
 
-	for (i = 0; i < tev->nargs; i++)
-		if (strglobmatch(tev->args[i].value, "[$@+-]*")) {
-			pr_warning("Please upgrade your kernel to at least "
-				   "3.14 to have access to feature %s\n",
+	for (i = 0; i < tev->nargs; i++) {
+		if (strchr(tev->args[i].value, '@')) {
+			pr_warning("%s accesses a variable by symbol name, but that is not supported for user application probe.\n",
 				   tev->args[i].value);
 			break;
 		}
+		if (strglobmatch(tev->args[i].value, "[$+-]*")) {
+			pr_warning("Please upgrade your kernel to at least 3.14 to have access to feature %s\n",
+				   tev->args[i].value);
+			break;
+		}
+	}
 out:
 	free(buf);
 }
@@ -3084,6 +3107,9 @@ static int find_probe_trace_events_from_map(struct perf_probe_event *pev,
 	for (j = 0; j < num_matched_functions; j++) {
 		sym = syms[j];
 
+		if (sym->type != STT_FUNC)
+			continue;
+
 		/* There can be duplicated symbols in the map */
 		for (i = 0; i < j; i++)
 			if (sym->start == syms[i]->start) {
@@ -3109,7 +3135,7 @@ static int find_probe_trace_events_from_map(struct perf_probe_event *pev,
 			goto err_out;
 		}
 		/* Add one probe point */
-		tp->address = map->unmap_ip(map, sym->start) + pp->offset;
+		tp->address = map__unmap_ip(map, sym->start) + pp->offset;
 
 		/* Check the kprobe (not in module) is within .text  */
 		if (!pev->uprobes && !pev->target &&
@@ -3221,7 +3247,7 @@ static int try_to_find_absolute_address(struct perf_probe_event *pev,
 	 * In __add_probe_trace_events, a NULL symbol is interpreted as
 	 * invalid.
 	 */
-	if (asprintf(&tp->symbol, "0x%lx", tp->address) < 0)
+	if (asprintf(&tp->symbol, "0x%" PRIx64, tp->address) < 0)
 		goto errout;
 
 	/* For kprobe, check range */
@@ -3232,7 +3258,7 @@ static int try_to_find_absolute_address(struct perf_probe_event *pev,
 		goto errout;
 	}
 
-	if (asprintf(&tp->realname, "abs_%lx", tp->address) < 0)
+	if (asprintf(&tp->realname, "abs_%" PRIx64, tp->address) < 0)
 		goto errout;
 
 	if (pev->target) {
@@ -3724,8 +3750,8 @@ out:
 int show_available_funcs(const char *target, struct nsinfo *nsi,
 			 struct strfilter *_filter, bool user)
 {
-        struct rb_node *nd;
 	struct map *map;
+	struct dso *dso;
 	int ret;
 
 	ret = init_probe_symbol_maps(user);
@@ -3751,18 +3777,17 @@ int show_available_funcs(const char *target, struct nsinfo *nsi,
 			       (target) ? : "kernel");
 		goto end;
 	}
-	if (!dso__sorted_by_name(map->dso))
-		dso__sort_by_name(map->dso);
+	dso = map__dso(map);
+	dso__sort_by_name(dso);
 
 	/* Show all (filtered) symbols */
 	setup_pager();
 
-	for (nd = rb_first_cached(&map->dso->symbol_names); nd;
-	     nd = rb_next(nd)) {
-		struct symbol_name_rb_node *pos = rb_entry(nd, struct symbol_name_rb_node, rb_node);
+	for (size_t i = 0; i < dso->symbol_names_len; i++) {
+		struct symbol *pos = dso->symbol_names[i];
 
-		if (strfilter__compare(_filter, pos->sym.name))
-			printf("%s\n", pos->sym.name);
+		if (strfilter__compare(_filter, pos->name))
+			printf("%s\n", pos->name);
 	}
 end:
 	map__put(map);

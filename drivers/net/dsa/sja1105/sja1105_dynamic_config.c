@@ -304,6 +304,15 @@ sja1105pqrs_common_l2_lookup_cmd_packing(void *buf, struct sja1105_dyn_cmd *cmd,
 			hostcmd = SJA1105_HOSTCMD_INVALIDATE;
 	}
 	sja1105_packing(p, &hostcmd, 25, 23, size, op);
+}
+
+static void
+sja1105pqrs_l2_lookup_cmd_packing(void *buf, struct sja1105_dyn_cmd *cmd,
+				  enum packing_op op)
+{
+	int entry_size = SJA1105PQRS_SIZE_L2_LOOKUP_ENTRY;
+
+	sja1105pqrs_common_l2_lookup_cmd_packing(buf, cmd, op, entry_size);
 
 	/* Hack - The hardware takes the 'index' field within
 	 * struct sja1105_l2_lookup_entry as the index on which this command
@@ -313,26 +322,18 @@ sja1105pqrs_common_l2_lookup_cmd_packing(void *buf, struct sja1105_dyn_cmd *cmd,
 	 * such that our API doesn't need to ask for a full-blown entry
 	 * structure when e.g. a delete is requested.
 	 */
-	sja1105_packing(buf, &cmd->index, 15, 6,
-			SJA1105PQRS_SIZE_L2_LOOKUP_ENTRY, op);
-}
-
-static void
-sja1105pqrs_l2_lookup_cmd_packing(void *buf, struct sja1105_dyn_cmd *cmd,
-				  enum packing_op op)
-{
-	int size = SJA1105PQRS_SIZE_L2_LOOKUP_ENTRY;
-
-	return sja1105pqrs_common_l2_lookup_cmd_packing(buf, cmd, op, size);
+	sja1105_packing(buf, &cmd->index, 15, 6, entry_size, op);
 }
 
 static void
 sja1110_l2_lookup_cmd_packing(void *buf, struct sja1105_dyn_cmd *cmd,
 			      enum packing_op op)
 {
-	int size = SJA1110_SIZE_L2_LOOKUP_ENTRY;
+	int entry_size = SJA1110_SIZE_L2_LOOKUP_ENTRY;
 
-	return sja1105pqrs_common_l2_lookup_cmd_packing(buf, cmd, op, size);
+	sja1105pqrs_common_l2_lookup_cmd_packing(buf, cmd, op, entry_size);
+
+	sja1105_packing(buf, &cmd->index, 10, 1, entry_size, op);
 }
 
 /* The switch is so retarded that it makes our command/entry abstraction
@@ -1169,6 +1170,70 @@ const struct sja1105_dynamic_table_ops sja1110_dyn_ops[BLK_IDX_MAX_DYN] = {
 	},
 };
 
+#define SJA1105_DYNAMIC_CONFIG_SLEEP_US		10
+#define SJA1105_DYNAMIC_CONFIG_TIMEOUT_US	100000
+
+static int
+sja1105_dynamic_config_poll_valid(struct sja1105_private *priv,
+				  const struct sja1105_dynamic_table_ops *ops,
+				  void *entry, bool check_valident,
+				  bool check_errors)
+{
+	u8 packed_buf[SJA1105_MAX_DYN_CMD_SIZE] = {};
+	struct sja1105_dyn_cmd cmd = {};
+	int rc;
+
+	/* Read back the whole entry + command structure. */
+	rc = sja1105_xfer_buf(priv, SPI_READ, ops->addr, packed_buf,
+			      ops->packed_size);
+	if (rc)
+		return rc;
+
+	/* Unpack the command structure, and return it to the caller in case it
+	 * needs to perform further checks on it (VALIDENT).
+	 */
+	ops->cmd_packing(packed_buf, &cmd, UNPACK);
+
+	/* Hardware hasn't cleared VALID => still working on it */
+	if (cmd.valid)
+		return -EAGAIN;
+
+	if (check_valident && !cmd.valident && !(ops->access & OP_VALID_ANYWAY))
+		return -ENOENT;
+
+	if (check_errors && cmd.errors)
+		return -EINVAL;
+
+	/* Don't dereference possibly NULL pointer - maybe caller
+	 * only wanted to see whether the entry existed or not.
+	 */
+	if (entry)
+		ops->entry_packing(packed_buf, entry, UNPACK);
+
+	return 0;
+}
+
+/* Poll the dynamic config entry's control area until the hardware has
+ * cleared the VALID bit, which means we have confirmation that it has
+ * finished processing the command.
+ */
+static int
+sja1105_dynamic_config_wait_complete(struct sja1105_private *priv,
+				     const struct sja1105_dynamic_table_ops *ops,
+				     void *entry, bool check_valident,
+				     bool check_errors)
+{
+	int err, rc;
+
+	err = read_poll_timeout(sja1105_dynamic_config_poll_valid,
+				rc, rc != -EAGAIN,
+				SJA1105_DYNAMIC_CONFIG_SLEEP_US,
+				SJA1105_DYNAMIC_CONFIG_TIMEOUT_US,
+				false, priv, ops, entry, check_valident,
+				check_errors);
+	return err < 0 ? err : rc;
+}
+
 /* Provides read access to the settings through the dynamic interface
  * of the switch.
  * @blk_idx	is used as key to select from the sja1105_dynamic_table_ops.
@@ -1195,7 +1260,6 @@ int sja1105_dynamic_config_read(struct sja1105_private *priv,
 	struct sja1105_dyn_cmd cmd = {0};
 	/* SPI payload buffer */
 	u8 packed_buf[SJA1105_MAX_DYN_CMD_SIZE] = {0};
-	int retries = 3;
 	int rc;
 
 	if (blk_idx >= BLK_IDX_MAX_DYN)
@@ -1233,40 +1297,17 @@ int sja1105_dynamic_config_read(struct sja1105_private *priv,
 		ops->entry_packing(packed_buf, entry, PACK);
 
 	/* Send SPI write operation: read config table entry */
+	mutex_lock(&priv->dynamic_config_lock);
 	rc = sja1105_xfer_buf(priv, SPI_WRITE, ops->addr, packed_buf,
 			      ops->packed_size);
 	if (rc < 0)
-		return rc;
+		goto out;
 
-	/* Loop until we have confirmation that hardware has finished
-	 * processing the command and has cleared the VALID field
-	 */
-	do {
-		memset(packed_buf, 0, ops->packed_size);
+	rc = sja1105_dynamic_config_wait_complete(priv, ops, entry, true, false);
+out:
+	mutex_unlock(&priv->dynamic_config_lock);
 
-		/* Retrieve the read operation's result */
-		rc = sja1105_xfer_buf(priv, SPI_READ, ops->addr, packed_buf,
-				      ops->packed_size);
-		if (rc < 0)
-			return rc;
-
-		cmd = (struct sja1105_dyn_cmd) {0};
-		ops->cmd_packing(packed_buf, &cmd, UNPACK);
-
-		if (!cmd.valident && !(ops->access & OP_VALID_ANYWAY))
-			return -ENOENT;
-		cpu_relax();
-	} while (cmd.valid && --retries);
-
-	if (cmd.valid)
-		return -ETIMEDOUT;
-
-	/* Don't dereference possibly NULL pointer - maybe caller
-	 * only wanted to see whether the entry existed or not.
-	 */
-	if (entry)
-		ops->entry_packing(packed_buf, entry, UNPACK);
-	return 0;
+	return rc;
 }
 
 int sja1105_dynamic_config_write(struct sja1105_private *priv,
@@ -1315,17 +1356,17 @@ int sja1105_dynamic_config_write(struct sja1105_private *priv,
 		ops->entry_packing(packed_buf, entry, PACK);
 
 	/* Send SPI write operation: read config table entry */
+	mutex_lock(&priv->dynamic_config_lock);
 	rc = sja1105_xfer_buf(priv, SPI_WRITE, ops->addr, packed_buf,
 			      ops->packed_size);
 	if (rc < 0)
-		return rc;
+		goto out;
 
-	cmd = (struct sja1105_dyn_cmd) {0};
-	ops->cmd_packing(packed_buf, &cmd, UNPACK);
-	if (cmd.errors)
-		return -EINVAL;
+	rc = sja1105_dynamic_config_wait_complete(priv, ops, NULL, false, true);
+out:
+	mutex_unlock(&priv->dynamic_config_lock);
 
-	return 0;
+	return rc;
 }
 
 static u8 sja1105_crc8_add(u8 crc, u8 byte, u8 poly)
@@ -1354,13 +1395,13 @@ u8 sja1105et_fdb_hash(struct sja1105_private *priv, const u8 *addr, u16 vid)
 {
 	struct sja1105_l2_lookup_params_entry *l2_lookup_params =
 		priv->static_config.tables[BLK_IDX_L2_LOOKUP_PARAMS].entries;
-	u64 poly_koopman = l2_lookup_params->poly;
+	u64 input, poly_koopman = l2_lookup_params->poly;
 	/* Convert polynomial from Koopman to 'normal' notation */
 	u8 poly = (u8)(1 + (poly_koopman << 1));
-	u64 vlanid = l2_lookup_params->shared_learn ? 0 : vid;
-	u64 input = (vlanid << 48) | ether_addr_to_u64(addr);
 	u8 crc = 0; /* seed */
 	int i;
+
+	input = ((u64)vid << 48) | ether_addr_to_u64(addr);
 
 	/* Mask the eight bytes starting from MSB one at a time */
 	for (i = 56; i >= 0; i -= 8) {

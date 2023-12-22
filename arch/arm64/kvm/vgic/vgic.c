@@ -24,11 +24,13 @@ struct vgic_global kvm_vgic_global_state __ro_after_init = {
 /*
  * Locking order is always:
  * kvm->lock (mutex)
- *   its->cmd_lock (mutex)
- *     its->its_lock (mutex)
- *       vgic_cpu->ap_list_lock		must be taken with IRQs disabled
- *         kvm->lpi_list_lock		must be taken with IRQs disabled
- *           vgic_irq->irq_lock		must be taken with IRQs disabled
+ *   vcpu->mutex (mutex)
+ *     kvm->arch.config_lock (mutex)
+ *       its->cmd_lock (mutex)
+ *         its->its_lock (mutex)
+ *           vgic_cpu->ap_list_lock		must be taken with IRQs disabled
+ *             kvm->lpi_list_lock		must be taken with IRQs disabled
+ *               vgic_irq->irq_lock		must be taken with IRQs disabled
  *
  * As the ap_list_lock might be taken from the timer interrupt handler,
  * we have to disable IRQs before taking this lock and everything lower
@@ -37,7 +39,7 @@ struct vgic_global kvm_vgic_global_state __ro_after_init = {
  * If you need to take multiple locks, always take the upper lock first,
  * then the lower ones, e.g. first take the its_lock, then the irq_lock.
  * If you are already holding a lock and need to take a higher one, you
- * have to drop the lower ranking lock first and re-aquire it after having
+ * have to drop the lower ranking lock first and re-acquire it after having
  * taken the upper one.
  *
  * When taking more than one ap_list_lock at the same time, always take the
@@ -106,7 +108,6 @@ struct vgic_irq *vgic_get_irq(struct kvm *kvm, struct kvm_vcpu *vcpu,
 	if (intid >= VGIC_MIN_LPI)
 		return vgic_get_lpi(kvm, intid);
 
-	WARN(1, "Looking up struct vgic_irq for reserved INTID");
 	return NULL;
 }
 
@@ -421,7 +422,7 @@ retry:
 /**
  * kvm_vgic_inject_irq - Inject an IRQ from a device to the vgic
  * @kvm:     The VM structure pointer
- * @cpuid:   The CPU for PPIs
+ * @vcpu:    The CPU for PPIs or NULL for global interrupts
  * @intid:   The INTID to inject a new state to.
  * @level:   Edge-triggered:  true:  to trigger the interrupt
  *			      false: to ignore the call
@@ -435,23 +436,21 @@ retry:
  * level-sensitive interrupts.  You can think of the level parameter as 1
  * being HIGH and 0 being LOW and all devices being active-HIGH.
  */
-int kvm_vgic_inject_irq(struct kvm *kvm, int cpuid, unsigned int intid,
-			bool level, void *owner)
+int kvm_vgic_inject_irq(struct kvm *kvm, struct kvm_vcpu *vcpu,
+			unsigned int intid, bool level, void *owner)
 {
-	struct kvm_vcpu *vcpu;
 	struct vgic_irq *irq;
 	unsigned long flags;
 	int ret;
-
-	trace_vgic_update_irq_pending(cpuid, intid, level);
 
 	ret = vgic_lazy_init(kvm);
 	if (ret)
 		return ret;
 
-	vcpu = kvm_get_vcpu(kvm, cpuid);
 	if (!vcpu && intid < VGIC_NR_PRIVATE_IRQS)
 		return -EINVAL;
+
+	trace_vgic_update_irq_pending(vcpu ? vcpu->vcpu_idx : 0, intid, level);
 
 	irq = vgic_get_irq(kvm, vcpu, intid);
 	if (!irq)
@@ -572,6 +571,21 @@ int kvm_vgic_unmap_phys_irq(struct kvm_vcpu *vcpu, unsigned int vintid)
 	vgic_put_irq(vcpu->kvm, irq);
 
 	return 0;
+}
+
+int kvm_vgic_get_map(struct kvm_vcpu *vcpu, unsigned int vintid)
+{
+	struct vgic_irq *irq = vgic_get_irq(vcpu->kvm, vcpu, vintid);
+	unsigned long flags;
+	int ret = -1;
+
+	raw_spin_lock_irqsave(&irq->irq_lock, flags);
+	if (irq->hw)
+		ret = irq->hwintid;
+	raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+
+	vgic_put_irq(vcpu->kvm, irq);
+	return ret;
 }
 
 /**
@@ -991,7 +1005,7 @@ int kvm_vgic_vcpu_pending_irq(struct kvm_vcpu *vcpu)
 void vgic_kick_vcpus(struct kvm *kvm)
 {
 	struct kvm_vcpu *vcpu;
-	int c;
+	unsigned long c;
 
 	/*
 	 * We've injected an interrupt, time to find out who deserves
@@ -1021,4 +1035,42 @@ bool kvm_vgic_map_is_active(struct kvm_vcpu *vcpu, unsigned int vintid)
 	vgic_put_irq(vcpu->kvm, irq);
 
 	return map_is_active;
+}
+
+/*
+ * Level-triggered mapped IRQs are special because we only observe rising
+ * edges as input to the VGIC.
+ *
+ * If the guest never acked the interrupt we have to sample the physical
+ * line and set the line level, because the device state could have changed
+ * or we simply need to process the still pending interrupt later.
+ *
+ * We could also have entered the guest with the interrupt active+pending.
+ * On the next exit, we need to re-evaluate the pending state, as it could
+ * otherwise result in a spurious interrupt by injecting a now potentially
+ * stale pending state.
+ *
+ * If this causes us to lower the level, we have to also clear the physical
+ * active state, since we will otherwise never be told when the interrupt
+ * becomes asserted again.
+ *
+ * Another case is when the interrupt requires a helping hand on
+ * deactivation (no HW deactivation, for example).
+ */
+void vgic_irq_handle_resampling(struct vgic_irq *irq,
+				bool lr_deactivated, bool lr_pending)
+{
+	if (vgic_irq_is_mapped_level(irq)) {
+		bool resample = false;
+
+		if (unlikely(vgic_irq_needs_resampling(irq))) {
+			resample = !(irq->active || irq->pending_latch);
+		} else if (lr_pending || (lr_deactivated && irq->line_level)) {
+			irq->line_level = vgic_get_phys_line_level(irq);
+			resample = !irq->line_level;
+		}
+
+		if (resample)
+			vgic_irq_set_phys_active(irq, false);
+	}
 }

@@ -185,6 +185,7 @@ static const struct ib_device_ops pvrdma_dev_ops = {
 	INIT_RDMA_OBJ_SIZE(ib_ah, pvrdma_ah, ibah),
 	INIT_RDMA_OBJ_SIZE(ib_cq, pvrdma_cq, ibcq),
 	INIT_RDMA_OBJ_SIZE(ib_pd, pvrdma_pd, ibpd),
+	INIT_RDMA_OBJ_SIZE(ib_qp, pvrdma_qp, ibqp),
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, pvrdma_ucontext, ibucontext),
 };
 
@@ -810,20 +811,10 @@ static int pvrdma_pci_probe(struct pci_dev *pdev,
 	}
 
 	/* Enable 64-Bit DMA */
-	if (pci_set_dma_mask(pdev, DMA_BIT_MASK(64)) == 0) {
-		ret = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64));
-		if (ret != 0) {
-			dev_err(&pdev->dev,
-				"pci_set_consistent_dma_mask failed\n");
-			goto err_free_resource;
-		}
-	} else {
-		ret = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
-		if (ret != 0) {
-			dev_err(&pdev->dev,
-				"pci_set_dma_mask failed\n");
-			goto err_free_resource;
-		}
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (ret) {
+		dev_err(&pdev->dev, "dma_set_mask failed\n");
+		goto err_free_resource;
 	}
 	dma_set_max_seg_size(&pdev->dev, UINT_MAX);
 	pci_set_master(pdev);
@@ -1030,10 +1021,8 @@ err_free_intrs:
 	pvrdma_free_irq(dev);
 	pci_free_irq_vectors(pdev);
 err_free_cq_ring:
-	if (dev->netdev) {
-		dev_put(dev->netdev);
-		dev->netdev = NULL;
-	}
+	dev_put(dev->netdev);
+	dev->netdev = NULL;
 	pvrdma_page_dir_cleanup(dev, &dev->cq_pdir);
 err_free_async_ring:
 	pvrdma_page_dir_cleanup(dev, &dev->async_pdir);
@@ -1073,10 +1062,8 @@ static void pvrdma_pci_remove(struct pci_dev *pdev)
 
 	flush_workqueue(event_wq);
 
-	if (dev->netdev) {
-		dev_put(dev->netdev);
-		dev->netdev = NULL;
-	}
+	dev_put(dev->netdev);
+	dev->netdev = NULL;
 
 	/* Unregister ib device */
 	ib_unregister_device(&dev->ib_dev);

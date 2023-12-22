@@ -14,6 +14,7 @@
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/kref.h>
+#include <linux/limits.h>
 #include <linux/list.h>
 #include <linux/minmax.h>
 #include <linux/netdevice.h>
@@ -34,7 +35,6 @@
 #include "bat_v_elp.h"
 #include "bat_v_ogm.h"
 #include "gateway_client.h"
-#include "gateway_common.h"
 #include "hard-interface.h"
 #include "hash.h"
 #include "log.h"
@@ -106,8 +106,7 @@ static void batadv_v_iface_update_mac(struct batadv_hard_iface *hard_iface)
 
 	batadv_v_primary_iface_set(hard_iface);
 out:
-	if (primary_if)
-		batadv_hardif_put(primary_if);
+	batadv_hardif_put(primary_if);
 }
 
 static void
@@ -366,8 +365,7 @@ batadv_v_orig_dump_entry(struct sk_buff *msg, u32 portid, u32 seq,
 	}
 
  out:
-	if (neigh_node_best)
-		batadv_neigh_node_put(neigh_node_best);
+	batadv_neigh_node_put(neigh_node_best);
 
 	*sub_s = 0;
 	return 0;
@@ -514,25 +512,6 @@ static void batadv_v_init_sel_class(struct batadv_priv *bat_priv)
 	atomic_set(&bat_priv->gw.sel_class, 50);
 }
 
-static ssize_t batadv_v_store_sel_class(struct batadv_priv *bat_priv,
-					char *buff, size_t count)
-{
-	u32 old_class, class;
-
-	if (!batadv_parse_throughput(bat_priv->soft_iface, buff,
-				     "B.A.T.M.A.N. V GW selection class",
-				     &class))
-		return -EINVAL;
-
-	old_class = atomic_read(&bat_priv->gw.sel_class);
-	atomic_set(&bat_priv->gw.sel_class, class);
-
-	if (old_class != class)
-		batadv_gw_reselect(bat_priv);
-
-	return count;
-}
-
 /**
  * batadv_v_gw_throughput_get() - retrieve the GW-bandwidth for a given GW
  * @gw_node: the GW to retrieve the metric for
@@ -568,10 +547,8 @@ static int batadv_v_gw_throughput_get(struct batadv_gw_node *gw_node, u32 *bw)
 
 	ret = 0;
 out:
-	if (router)
-		batadv_neigh_node_put(router);
-	if (router_ifinfo)
-		batadv_neigh_ifinfo_put(router_ifinfo);
+	batadv_neigh_node_put(router);
+	batadv_neigh_ifinfo_put(router_ifinfo);
 
 	return ret;
 }
@@ -599,8 +576,7 @@ batadv_v_gw_get_best_gw_node(struct batadv_priv *bat_priv)
 		if (curr_gw && bw <= max_bw)
 			goto next;
 
-		if (curr_gw)
-			batadv_gw_node_put(curr_gw);
+		batadv_gw_node_put(curr_gw);
 
 		curr_gw = gw_node;
 		kref_get(&curr_gw->refcount);
@@ -662,10 +638,8 @@ static bool batadv_v_gw_is_eligible(struct batadv_priv *bat_priv,
 
 	ret = true;
 out:
-	if (curr_gw)
-		batadv_gw_node_put(curr_gw);
-	if (orig_gw)
-		batadv_gw_node_put(orig_gw);
+	batadv_gw_node_put(curr_gw);
+	batadv_gw_node_put(orig_gw);
 
 	return ret;
 }
@@ -764,12 +738,9 @@ static int batadv_v_gw_dump_entry(struct sk_buff *msg, u32 portid,
 	ret = 0;
 
 out:
-	if (curr_gw)
-		batadv_gw_node_put(curr_gw);
-	if (router_ifinfo)
-		batadv_neigh_ifinfo_put(router_ifinfo);
-	if (router)
-		batadv_neigh_node_put(router);
+	batadv_gw_node_put(curr_gw);
+	batadv_neigh_ifinfo_put(router_ifinfo);
+	batadv_neigh_node_put(router);
 	return ret;
 }
 
@@ -828,7 +799,7 @@ static struct batadv_algo_ops batadv_batman_v __read_mostly = {
 	},
 	.gw = {
 		.init_sel_class = batadv_v_init_sel_class,
-		.store_sel_class = batadv_v_store_sel_class,
+		.sel_class_max = U32_MAX,
 		.get_best_gw_node = batadv_v_gw_get_best_gw_node,
 		.is_eligible = batadv_v_gw_is_eligible,
 		.dump = batadv_v_gw_dump,

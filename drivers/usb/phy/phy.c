@@ -80,16 +80,16 @@ static struct usb_phy *__of_usb_find_phy(struct device_node *node)
 	return ERR_PTR(-EPROBE_DEFER);
 }
 
-static struct usb_phy *__device_to_usb_phy(struct device *dev)
+static struct usb_phy *__device_to_usb_phy(const struct device *dev)
 {
 	struct usb_phy *usb_phy;
 
 	list_for_each_entry(usb_phy, &phy_list, head) {
 		if (usb_phy->dev == dev)
-			break;
+			return usb_phy;
 	}
 
-	return usb_phy;
+	return NULL;
 }
 
 static void usb_phy_set_default_current(struct usb_phy *usb_phy)
@@ -145,13 +145,19 @@ static void usb_phy_notify_charger_work(struct work_struct *work)
 	kobject_uevent(&usb_phy->dev->kobj, KOBJ_CHANGE);
 }
 
-static int usb_phy_uevent(struct device *dev, struct kobj_uevent_env *env)
+static int usb_phy_uevent(const struct device *dev, struct kobj_uevent_env *env)
 {
-	struct usb_phy *usb_phy;
+	const struct usb_phy *usb_phy;
 	char uchger_state[50] = { 0 };
 	char uchger_type[50] = { 0 };
+	unsigned long flags;
 
+	spin_lock_irqsave(&phy_lock, flags);
 	usb_phy = __device_to_usb_phy(dev);
+	spin_unlock_irqrestore(&phy_lock, flags);
+
+	if (!usb_phy)
+		return -ENODEV;
 
 	snprintf(uchger_state, ARRAY_SIZE(uchger_state),
 		 "USB_CHARGER_STATE=%s", usb_chger_state[usb_phy->chg_state]);

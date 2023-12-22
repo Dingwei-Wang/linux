@@ -231,6 +231,7 @@ static int gyro_3d_capture_sample(struct hid_sensor_hub_device *hsdev,
 		gyro_state->timestamp =
 			hid_sensor_convert_timestamp(&gyro_state->common_attributes,
 						     *(s64 *)raw_data);
+		ret = 0;
 	break;
 	default:
 		break;
@@ -303,8 +304,8 @@ static int hid_gyro_3d_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	indio_dev->channels = kmemdup(gyro_3d_channels,
-				      sizeof(gyro_3d_channels), GFP_KERNEL);
+	indio_dev->channels = devm_kmemdup(&pdev->dev, gyro_3d_channels,
+					   sizeof(gyro_3d_channels), GFP_KERNEL);
 	if (!indio_dev->channels) {
 		dev_err(&pdev->dev, "failed to duplicate channels\n");
 		return -ENOMEM;
@@ -315,7 +316,7 @@ static int hid_gyro_3d_probe(struct platform_device *pdev)
 				   HID_USAGE_SENSOR_GYRO_3D, gyro_state);
 	if (ret) {
 		dev_err(&pdev->dev, "failed to setup attributes\n");
-		goto error_free_dev_mem;
+		return ret;
 	}
 
 	indio_dev->num_channels = ARRAY_SIZE(gyro_3d_channels);
@@ -329,7 +330,7 @@ static int hid_gyro_3d_probe(struct platform_device *pdev)
 					&gyro_state->common_attributes);
 	if (ret < 0) {
 		dev_err(&pdev->dev, "trigger setup failed\n");
-		goto error_free_dev_mem;
+		return ret;
 	}
 
 	ret = iio_device_register(indio_dev);
@@ -354,13 +355,11 @@ error_iio_unreg:
 	iio_device_unregister(indio_dev);
 error_remove_trigger:
 	hid_sensor_remove_trigger(indio_dev, &gyro_state->common_attributes);
-error_free_dev_mem:
-	kfree(indio_dev->channels);
 	return ret;
 }
 
 /* Function to deinitialize the processing for usage id */
-static int hid_gyro_3d_remove(struct platform_device *pdev)
+static void hid_gyro_3d_remove(struct platform_device *pdev)
 {
 	struct hid_sensor_hub_device *hsdev = pdev->dev.platform_data;
 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
@@ -369,9 +368,6 @@ static int hid_gyro_3d_remove(struct platform_device *pdev)
 	sensor_hub_remove_callback(hsdev, HID_USAGE_SENSOR_GYRO_3D);
 	iio_device_unregister(indio_dev);
 	hid_sensor_remove_trigger(indio_dev, &gyro_state->common_attributes);
-	kfree(indio_dev->channels);
-
-	return 0;
 }
 
 static const struct platform_device_id hid_gyro_3d_ids[] = {
@@ -390,7 +386,7 @@ static struct platform_driver hid_gyro_3d_platform_driver = {
 		.pm	= &hid_sensor_pm_ops,
 	},
 	.probe		= hid_gyro_3d_probe,
-	.remove		= hid_gyro_3d_remove,
+	.remove_new	= hid_gyro_3d_remove,
 };
 module_platform_driver(hid_gyro_3d_platform_driver);
 
